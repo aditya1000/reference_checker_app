@@ -3,9 +3,15 @@ import os
 import time
 import json
 import base64
+import logging
 import regex as rx
 import requests
-from typing import Dict, Optional
+from typing import Dict, Optional, List
+from rapidfuzz import fuzz
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 DOI_RX = rx.compile(r'(10\.\d{4,9}/[-._;()/:A-Z0-9]+)', rx.I)
 ARXIV_RX = rx.compile(r'([0-9]{4}\.[0-9]{4,5})')
@@ -19,23 +25,37 @@ def polite_headers():
     return hdrs
 
 def resolve_reference(ref: Dict) -> Dict:
-    """Return dict with best_id, type, title, authors, year, doi/pmid/arxiv."""
+    """Enhanced reference resolution with multiple fallback strategies."""
     out = {**ref}
     doi = ref.get("doi")
     pmid = ref.get("pmid")
     arx = ref.get("arxiv_id")
 
-    # Try to find DOI via Crossref if missing
+    # Enhanced DOI extraction from raw text
+    if not doi:
+        doi = _extract_enhanced_doi(ref.get("raw", ""))
+        if doi:
+            out["doi"] = doi
+
+    # Try multiple resolution strategies if no identifiers found
     if not any([doi, pmid, arx]):
-        q = ref.get("raw","")[:300]
-        try:
-            r = requests.get("https://api.crossref.org/works", params={"query.bibliographic": q, "rows":1}, headers=polite_headers(), timeout=20)
-            if r.ok:
-                items = r.json().get("message",{}).get("items",[])
-                if items:
-                    doi = items[0].get("DOI")
-        except Exception:
-            pass
+        # Strategy 1: Crossref bibliographic search
+        doi = _crossref_bibliographic_search(ref)
+        if doi:
+            out["doi"] = doi
+        
+        # Strategy 2: Try fuzzy title matching with OpenAlex
+        if not doi:
+            resolved_data = _openalex_title_search(ref)
+            if resolved_data:
+                out.update(resolved_data)
+                doi = resolved_data.get("doi")
+        
+        # Strategy 3: PubMed title search for biomedical papers
+        if not doi and not pmid:
+            pmid = _pubmed_title_search(ref)
+            if pmid:
+                out["pmid"] = pmid
 
     # Prefer DOI; then PMID; then arXiv
     best_id = None
@@ -174,3 +194,239 @@ def _download_and_extract_text(url: str) -> str:
     except Exception:
         return ""
     return ""
+
+def _extract_enhanced_doi(text: str) -> Optional[str]:
+    """Enhanced DOI extraction with multiple patterns."""
+    if not text:
+        return None
+    
+    # Standard DOI pattern
+    doi_match = DOI_RX.search(text)
+    if doi_match:
+        return doi_match.group(1)
+    
+    # Additional patterns for common variations
+    patterns = [
+        r'doi[:\s]*([0-9]+\.[0-9]+/[^\s]+)',
+        r'https?://(?:dx\.)?doi\.org/([0-9]+\.[0-9]+/[^\s]+)',
+        r'DOI[:\s]*([0-9]+\.[0-9]+/[^\s]+)',
+    ]
+    
+    for pattern in patterns:
+        match = rx.search(pattern, text, rx.IGNORECASE)
+        if match:
+            return match.group(1)
+    
+    return None
+
+def _crossref_bibliographic_search(ref: Dict) -> Optional[str]:
+    """Enhanced Crossref search with better query construction."""
+    raw_text = ref.get("raw", "")
+    if len(raw_text) < 20:
+        return None
+    
+    # Clean and prepare search query
+    query = rx.sub(r'[^\w\s\.-]', ' ', raw_text[:300])
+    query = rx.sub(r'\s+', ' ', query).strip()
+    
+    try:
+        params = {
+            "query.bibliographic": query,
+            "rows": 3,
+            "select": "DOI,title,author,published-print,published-online"
+        }
+        
+        r = requests.get("https://api.crossref.org/works", 
+                        params=params, 
+                        headers=polite_headers(), 
+                        timeout=25)
+        
+        if r.ok:
+            items = r.json().get("message", {}).get("items", [])
+            
+            # Use fuzzy matching to find best result
+            best_doi = _find_best_crossref_match(ref, items)
+            if best_doi:
+                logger.info(f"Found DOI via Crossref search: {best_doi}")
+                return best_doi
+                
+    except Exception as e:
+        logger.warning(f"Crossref search failed: {e}")
+    
+    return None
+
+def _find_best_crossref_match(ref: Dict, items: List[Dict]) -> Optional[str]:
+    """Find best matching Crossref result using fuzzy matching."""
+    if not items:
+        return None
+    
+    ref_text = ref.get("raw", "").lower()
+    best_score = 0
+    best_doi = None
+    
+    for item in items:
+        score = 0
+        
+        # Check title similarity
+        titles = item.get("title", [])
+        if titles:
+            title_score = fuzz.partial_ratio(ref_text, titles[0].lower())
+            score += title_score * 0.6
+        
+        # Check author similarity
+        authors = item.get("author", [])
+        if authors:
+            author_names = [f"{a.get('given', '')} {a.get('family', '')}" for a in authors[:3]]
+            author_text = " ".join(author_names).lower()
+            author_score = fuzz.partial_ratio(ref_text, author_text)
+            score += author_score * 0.4
+        
+        if score > best_score and score > 70:
+            best_score = score
+            best_doi = item.get("DOI")
+    
+    return best_doi
+
+def _openalex_title_search(ref: Dict) -> Optional[Dict]:
+    """Search OpenAlex for reference by title."""
+    raw_text = ref.get("raw", "")
+    
+    # Extract potential title
+    title_match = rx.search(r'^[^.]+\.([^.]{20,})', raw_text)
+    if not title_match:
+        return None
+    
+    title = title_match.group(1).strip()
+    
+    try:
+        params = {
+            "search": title[:200],
+            "per-page": 3
+        }
+        
+        r = requests.get("https://api.openalex.org/works", 
+                        params=params,
+                        timeout=20)
+        
+        if r.ok:
+            results = r.json().get("results", [])
+            best_match = _find_best_openalex_match(ref, results)
+            if best_match:
+                logger.info(f"Found match via OpenAlex")
+                return best_match
+                
+    except Exception as e:
+        logger.warning(f"OpenAlex search failed: {e}")
+    
+    return None
+
+def _find_best_openalex_match(ref: Dict, results: List[Dict]) -> Optional[Dict]:
+    """Find best matching OpenAlex result."""
+    if not results:
+        return None
+    
+    ref_text = ref.get("raw", "").lower()
+    best_score = 0
+    best_match = None
+    
+    for result in results:
+        score = 0
+        title = result.get("title", "")
+        if title:
+            title_score = fuzz.ratio(ref_text, title.lower())
+            score += title_score * 0.7
+        
+        pub_year = result.get("publication_year")
+        if pub_year:
+            year_match = rx.search(r'\b' + str(pub_year) + r'\b', ref_text)
+            if year_match:
+                score += 20
+        
+        if score > best_score and score > 75:
+            best_score = score
+            doi = result.get("doi")
+            if doi:
+                doi = doi.replace("https://doi.org/", "")
+            
+            best_match = {
+                "doi": doi,
+                "title": result.get("title"),
+                "year": pub_year,
+                "journal": result.get("primary_location", {}).get("source", {}).get("display_name")
+            }
+    
+    return best_match
+
+def _pubmed_title_search(ref: Dict) -> Optional[str]:
+    """Search PubMed for biomedical references by title."""
+    raw_text = ref.get("raw", "")
+    
+    title_match = rx.search(r'^[^.]+\.([^.]{15,})', raw_text)
+    if not title_match:
+        return None
+    
+    title = title_match.group(1).strip()[:100]
+    
+    try:
+        search_params = {
+            "db": "pubmed",
+            "term": f'"{title}"[Title]',
+            "retmax": 3,
+            "retmode": "json",
+            "email": os.getenv("NCBI_EMAIL", "")
+        }
+        
+        r = requests.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+                        params=search_params,
+                        timeout=20)
+        
+        if r.ok:
+            result = r.json()
+            pmids = result.get("esearchresult", {}).get("idlist", [])
+            
+            if pmids:
+                pmid = pmids[0]
+                if _verify_pubmed_match(ref, pmid):
+                    logger.info(f"Found PMID via PubMed search: {pmid}")
+                    return pmid
+                    
+    except Exception as e:
+        logger.warning(f"PubMed search failed: {e}")
+    
+    return None
+
+def _verify_pubmed_match(ref: Dict, pmid: str) -> bool:
+    """Verify PubMed result matches the reference."""
+    try:
+        params = {
+            "db": "pubmed",
+            "id": pmid,
+            "retmode": "json",
+            "email": os.getenv("NCBI_EMAIL", "")
+        }
+        
+        r = requests.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+                        params=params,
+                        timeout=15)
+        
+        if r.ok:
+            data = r.json().get("result", {}).get(pmid, {})
+            title = data.get("title", "")
+            authors = data.get("authors", [])
+            
+            ref_text = ref.get("raw", "").lower()
+            
+            title_score = fuzz.partial_ratio(ref_text, title.lower()) if title else 0
+            
+            author_score = 0
+            if authors:
+                author_text = " ".join([a.get("name", "") for a in authors[:3]]).lower()
+                author_score = fuzz.partial_ratio(ref_text, author_text)
+            
+            combined_score = max(title_score, author_score)
+            return combined_score > 70
+            
+    except Exception:
+        pass
+    
+    return False
