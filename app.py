@@ -12,7 +12,8 @@ from pathlib import Path
 
 from checker.parsing import extract_pdf_text, parse_reference_entries, extract_in_text_citations
 from checker.retrieval import resolve_reference, fetch_source_text
-from checker.verification import build_index, best_support_for_claim
+from checker.verification import build_index, best_support_for_claim, analyze_citation_patterns
+from checker.evaluation import ReferenceCheckerEvaluator, create_performance_dashboard
 
 st.set_page_config(page_title="Reference Checker", layout="wide")
 
@@ -93,6 +94,28 @@ if st.button("Run Checker", disabled=pdf_file is None):
 
         df_claims = pd.DataFrame(results)
         st.dataframe(df_claims.fillna(""), use_container_width=True)
+
+        # Enhanced analysis
+        if results:
+            st.subheader("Citation Analysis Summary")
+            analysis = analyze_citation_patterns(results)
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Claims", analysis["total_claims"])
+                st.metric("High Confidence", analysis["confidence_stats"]["high_confidence"])
+            with col2:
+                st.metric("Supported Claims", analysis["verdict_distribution"].get("supported", 0))
+                st.metric("Contradicted Claims", analysis["verdict_distribution"].get("contradicted", 0))
+            with col3:
+                st.metric("Average Confidence", f"{analysis['confidence_stats']['mean']:.2f}")
+                st.metric("Potential Issues", len(analysis["potential_issues"]))
+            
+            # Show potential issues if any
+            if analysis["potential_issues"]:
+                st.warning("⚠️ Potential citation issues detected:")
+                for issue in analysis["potential_issues"][:3]:  # Show first 3
+                    st.write(f"• **{issue['type'].title()}**: {issue['claim']}")
 
         st.download_button(
             "Download claim support CSV",
